@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>2D 万有引力模拟</title>
+    <style>
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial;
+      }
+      #topbar {
+        height: 56px;
+        background: #0b1226;
+        color: #fff;
+        display: flex;
+        align-items: center;
+        padding: 0 12px;
+        gap: 12px;
+      }
+      #topbar input,
+      #topbar button {
+        padding: 6px 10px;
+        border-radius: 6px;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        background: rgba(255, 255, 255, 0.02);
+        color: #fff;
+      }
+      #topbar label {
+        font-size: 14px;
+      }
+      #canvas-wrap {
+        position: relative;
+        height: calc(100% - 56px);
+        background: #0f1724;
+      }
+      canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+      }
+      #overlay {
+        position: absolute;
+        left: 8px;
+        top: 8px;
+        color: #fff;
+        background: rgba(0, 0, 0, 0.3);
+        padding: 8px;
+        border-radius: 6px;
+        font-size: 13px;
+      }
+      #dragPreview {
+        position: absolute;
+        pointer-events: none;
+      }
+      .stat {
+        line-height: 1.4;
+      }
+      .small {
+        font-size: 12px;
+        color: #ddd;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="topbar">
+      <label class="stat"
+        >太阳质量M(kg)：<input
+          id="sunMass"
+          type="number"
+          value="10000"
+          min="10"
+          step="10"
+          style="width: 90px"
+      /></label>
+      <label
+        >新天体m(kg)：<input
+          id="massInput"
+          type="number"
+          value="10"
+          min="0.1"
+          step="0.1"
+          style="width: 90px"
+      /></label>
+      <label
+        >引力常数G：<input
+          id="GInput"
+          type="number"
+          value="100"
+          step="1"
+          style="width: 90px"
+      /></label>
+      <label class="stat"
+        >时间系数dt：<input
+          id="dt"
+          type="number"
+          value="0.016"
+          step="0.001"
+          style="width: 70px"
+      /></label>
+      <button id="btnClear">清空小天体</button>
+      <button id="centerBtn">重置太阳</button>
+      <button id="btnPause">暂停</button>
+
+      <div class="small" style="margin-left: 8px">
+        说明：左键点击+拖动设置速度；左键点击空白处生成天体；滚轮缩放；右键拖动平移（长按右键拖动）。
+      </div>
+    </div>
+    <div id="canvas-wrap">
+      <canvas id="c"></canvas>
+      <div id="overlay"></div>
+      <svg id="dragPreview"></svg>
+    </div>
+
+    <!-- 公式（LaTeX）: 万有引力 F = G \frac{m_1 m_2}{r^2}，加上软化项 r^2 + \epsilon^2 避免奇异性。 -->
+
+    <script>
+      const canvas = document.getElementById("c");
+      const ctx = canvas.getContext("2d");
+      const overlay = document.getElementById("overlay");
+      const svg = document.getElementById("dragPreview");
+      const sunMass = document.getElementById("sunMass");
+      const massInput = document.getElementById("massInput");
+      const GInput = document.getElementById("GInput");
+      const dtInput = document.getElementById("dt");
+      const btnClear = document.getElementById("btnClear");
+      const btnPause = document.getElementById("btnPause");
+
+      // 使 canvas 分辨率正确
+      function resize() {
+        const r = window.devicePixelRatio || 1;
+        canvas.width = canvas.clientWidth * r;
+        canvas.height = canvas.clientHeight * r;
+        ctx.setTransform(r, 0, 0, r, 0, 0);
+      }
+      window.addEventListener("resize", resize);
+      resize();
+
+      // 相机用于放缩和平移
+      const camera = {
+        x: 0,
+        y: 0, // 世界坐标中心对齐
+        scale: 1,
+        toScreen(px, py) {
+          const cx = canvas.width / 2 / DPR + this.x;
+          const cy = canvas.height / 2 / DPR + this.y;
+          return {
+            x: (px - cx) * this.scale + canvas.clientWidth / 2,
+            y: (py - cy) * this.scale + canvas.clientHeight / 2,
+          };
+        },
+        toWorld(sx, sy) {
+          const cx = canvas.clientWidth / 2;
+          const cy = canvas.clientHeight / 2;
+          const wx = (sx - cx) / this.scale + (canvas.width / 2 / DPR + this.x);
+          const wy =
+            (sy - cy) / this.scale + (canvas.height / 2 / DPR + this.y);
+          return { x: wx, y: wy };
+        },
+      };
+
+      // 坐标转换的设备像素比
+      const DPR = window.devicePixelRatio || 1;
+
+      // 天体数组
+      const bodies = [];
+
+      // 太阳：位于世界坐标中心（固定）
+      const SUN = {
+        x: canvas.width / 2 / DPR, // world coord
+        y: canvas.height / 2 / DPR,
+        mass: sunMass.value,
+        radius: Math.sqrt(sunMass.value) * 0.3,
+        fixed: true,
+      };
+
+      // 初速度拖拽状态
+      let isDragging = false;
+      let dragStart = null; // {sx,sy} 屏幕坐标
+      let dragStartWorld = null; // 世界坐标
+      let lastMouse = { x: 0, y: 0 };
+
+      // 右键平移状态
+      let isPanning = false;
+      let panStart = null; // 屏幕
+      let camStart = null;
+
+      // 运行参数
+      let paused = false;
+      // let timeStep = 0.016; // 模拟 dt
+      const softening = 3; // 软化项
+      const maxBodies = 400; // 最大天体数
+      const trailArrMaxSize = 60; // 轨迹数组最大长度
+      const switchTrails = false; // 是否开启轨迹功能
+
+      // 添加天体函数
+      function addBody(x, y, mass, vx = 0, vy = 0) {
+        if (bodies.length >= maxBodies) return;
+        bodies.push({
+          x,
+          y,
+          mass,
+          vx,
+          vy,
+          ax: 0,
+          ay: 0,
+          radius: Math.sqrt(mass) * 0.3, //Math.max(2, Math.log10(mass + 1) * 2),
+          color: pickColor(bodies.length + 1),
+          trail: []
+        });
+      }
+
+      // 事件处理
+      canvas.addEventListener("mousedown", (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const sx = e.clientX - rect.left;
+        const sy = e.clientY - rect.top;
+        lastMouse = { x: sx, y: sy };
+
+        if (e.button === 0) {
+          // 左键: 开始设置速度向量
+          isDragging = true;
+          dragStart = { sx, sy };
+          dragStartWorld = camera.toWorld(sx, sy);
+          updateDragPreview(sx, sy, sx, sy);
+        } else if (e.button === 2) {
+          // 右键: 开始平移
+          isPanning = true;
+          panStart = { sx, sy };
+          camStart = { x: camera.x, y: camera.y };
+        }
+      });
+
+      canvas.addEventListener("mousemove", (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const sx = e.clientX - rect.left;
+        const sy = e.clientY - rect.top;
+        lastMouse = { x: sx, y: sy };
+        if (isDragging) {
+          updateDragPreview(dragStart.sx, dragStart.sy, sx, sy);
+          const wstart = dragStartWorld;
+          const wcur = camera.toWorld(sx, sy);
+          const vx = (wcur.x - wstart.x) / 0.5; // 缩放速度感
+          const vy = (wcur.y - wstart.y) / 0.5;
+          showOverlay(
+            `质量: ${Number(massInput.value).toFixed(
+              2
+            )}  初速度 vx=${vx.toFixed(2)} vy=${vy.toFixed(2)}`
+          );
+        } else if (isPanning) {
+          const dx = (sx - panStart.sx) / camera.scale;
+          const dy = (sy - panStart.sy) / camera.scale;
+          camera.x = camStart.x - dx;
+          camera.y = camStart.y - dy;
+        }
+      });
+
+      // 鼠标释放：左键释放生成天体，右键释放停止平移
+      canvas.addEventListener("mouseup", (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const sx = e.clientX - rect.left;
+        const sy = e.clientY - rect.top;
+        if (e.button === 0 && isDragging) {
+          // 生成天体
+          const w = camera.toWorld(dragStart.sx, dragStart.sy);
+          const wend = camera.toWorld(sx, sy);
+          const vx = (wend.x - w.x) / 0.5;
+          const vy = (wend.y - w.y) / 0.5;
+          const mass = Math.max(0.01, Number(massInput.value) || 1);
+          addBody(w.x, w.y, mass, vx, vy);
+          isDragging = false;
+          clearDragPreview();
+          showOverlay("");
+        } else if (e.button === 2 && isPanning) {
+          isPanning = false;
+        }
+      });
+
+      // 防止右键菜单干扰
+      canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+      // 单击（无拖动）直接创建天体并赋予初速度为与太阳的切向速度（便于围绕太阳运动）
+      // canvas.addEventListener('click', (e)=>{
+      //   // 如果发生过拖动，则 click 事件也会触发，不希望重复创建 -> 仅当没有拖动时创建
+      //   if (isDragging) return;
+      //   const rect = canvas.getBoundingClientRect();
+      //   const sx = e.clientX - rect.left;
+      //   const sy = e.clientY - rect.top;
+      //   const w = camera.toWorld(sx,sy);
+      //   const mass = Math.max(0.01, Number(massInput.value) || 1);
+      //   // 计算与太阳的切向速度使其大致绕太阳公转（近似圆周速度）
+      //   const dx = w.x - SUN.x, dy = w.y - SUN.y;
+      //   const r = Math.sqrt(dx*dx + dy*dy) + 1e-6;
+      //   const G = Number(GInput.value);
+      //   const v_circ = Math.sqrt(G * SUN.mass / r);
+      //   // 切向方向
+      //   const vx = -dy/r * v_circ * 0.95;
+      //   const vy = dx/r * v_circ * 0.95;
+      //   addBody(w.x, w.y, mass, vx, vy);
+      // });
+
+      // 滚轮缩放
+      canvas.addEventListener(
+        "wheel",
+        (e) => {
+          e.preventDefault();
+          const rect = canvas.getBoundingClientRect();
+          const sx = e.clientX - rect.left;
+          const sy = e.clientY - rect.top;
+          const worldBefore = camera.toWorld(sx, sy);
+          const delta = -e.deltaY;
+          const zoomFactor = Math.exp(delta * 0.0015);
+          camera.scale *= zoomFactor;
+          camera.scale = Math.min(Math.max(camera.scale, 0.05), 6);
+          // 缩放时保持鼠标指向的世界点不动
+          const worldAfter = camera.toWorld(sx, sy);
+          camera.x += worldBefore.x - worldAfter.x;
+          camera.y += worldBefore.y - worldAfter.y;
+        },
+        { passive: false }
+      );
+
+      btnClear.addEventListener("click", () => {
+        bodies.length = 0;
+      });
+      btnPause.addEventListener("click", () => {
+        paused = !paused;
+        btnPause.textContent = paused ? "继续" : "暂停";
+      });
+
+      // 拖拽可视化（SVG）
+      function updateDragPreview(sx1, sy1, sx2, sy2) {
+        svg.setAttribute("width", canvas.clientWidth);
+        svg.setAttribute("height", canvas.clientHeight);
+        svg.innerHTML = "";
+        const line = document.createElementNS(
+          "http://www.w3.org/2000/svg",
+          "line"
+        );
+        line.setAttribute("x1", sx1);
+        line.setAttribute("y1", sy1);
+        line.setAttribute("x2", sx2);
+        line.setAttribute("y2", sy2);
+        line.setAttribute("stroke", "white");
+        line.setAttribute("stroke-width", "1.5");
+        line.setAttribute("stroke-opacity", "0.9");
+        svg.appendChild(line);
+        const circ = document.createElementNS(
+          "http://www.w3.org/2000/svg",
+          "circle"
+        );
+        circ.setAttribute("cx", sx1);
+        circ.setAttribute("cy", sy1);
+        circ.setAttribute("r", 6);
+        circ.setAttribute("fill", "rgba(255,255,255,0.9)");
+        svg.appendChild(circ);
+      }
+      function clearDragPreview() {
+        svg.innerHTML = "";
+      }
+
+      function showOverlay(text) {
+        overlay.innerHTML = text;
+      }
+
+      // 物理更新：简单的欧拉/半隐式欧拉积分
+      function physicsStep(dt) {
+        const G = Number(GInput.value);
+        // 清零加速度
+        for (let b of bodies) {
+          b.ax = 0;
+          b.ay = 0;
+        }
+
+        // 太阳对所有天体的引力
+        for (let i = 0; i < bodies.length; i++) {
+          const bi = bodies[i];
+          // 与太阳
+          const dx = SUN.x - bi.x,
+              dy = SUN.y - bi.y;
+          let r2 = calR(SUN, bi);
+          let r = Math.sqrt(r2);
+          let f = (G * SUN.mass * bi.mass) / r2;
+          bi.ax += (f * dx) / (r * bi.mass);
+          bi.ay += (f * dy) / (r * bi.mass);
+        }
+
+        // 天体之间相互作用 O(N^2)
+        for (let i = 0; i < bodies.length; i++) {
+          for (let j = i + 1; j < bodies.length; j++) {
+            const a = bodies[i];
+            const b = bodies[j];
+            const dx = b.x - a.x,
+              dy = b.y - a.y;
+            const r2 = calR(a, b);
+            const r = Math.sqrt(r2);
+            const F = (G * a.mass * b.mass) / r2;
+            // acceleration
+            const ax = (F * dx) / (r * a.mass);
+            const ay = (F * dy) / (r * a.mass);
+            const bx = (-F * dx) / (r * b.mass);
+            const by = (-F * dy) / (r * b.mass);
+            a.ax += ax;
+            a.ay += ay;
+            b.ax += bx;
+            b.ay += by;
+          }
+        }
+
+        // 更新速度和位置 (半隐式欧拉)
+        for (let b of bodies) {
+          b.vx += b.ax * dt;
+          b.vy += b.ay * dt;
+          b.x += b.vx * dt;
+          b.y += b.vy * dt;
+          // 更新轨迹数组
+          b.trail.push({x: b.x, y: b.y});
+          if (b.trail.length > trailArrMaxSize) b.trail.shift();
+        }
+      }
+
+      // 计算引力距离
+      function calR(a, b) {
+        // 软化附加值
+        const rp = a.radius + b.radius;
+        const dx = a.x - b.x;
+        const dy = a.y - b.y;
+        const r = dx * dx + dy * dy + rp;
+        return r;
+      }
+
+      // 绘图
+      function render() {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        // 背景 网格
+        drawGrid();
+        // 画轨迹
+        drawTrails(switchTrails);
+        // 画太阳（固定在世界中心）
+        drawCircleWorld(SUN.x, SUN.y, SUN.radius, "#ffcc33", true);
+        // 画天体
+        for (let b of bodies) {
+          drawCircleWorld(b.x, b.y, Math.max(2, b.radius), b.color, false); //'#66ccff'
+        }
+        // 如果拖拽，画速度箭头
+        if (isDragging) {
+          drawDragArrow();
+        }
+      }
+
+      function drawGrid() {
+        const step = 100 * camera.scale;
+        ctx.save();
+        // transform to camera
+        ctx.translate(canvas.clientWidth / 2, canvas.clientHeight / 2);
+        ctx.scale(camera.scale, camera.scale);
+        ctx.translate(
+          -(canvas.width / 2 / DPR + camera.x),
+          -(canvas.height / 2 / DPR + camera.y)
+        );
+
+        // 绘制模糊网格
+        ctx.beginPath();
+        const left = camera.x - canvas.clientWidth / (2 * camera.scale) - 2000;
+        const right = camera.x + canvas.clientWidth / (2 * camera.scale) + 2000;
+        const top = camera.y - canvas.clientHeight / (2 * camera.scale) - 2000;
+        const bottom =
+          camera.y + canvas.clientHeight / (2 * camera.scale) + 2000;
+        const gridStep = 100;
+        ctx.strokeStyle = "rgba(255,255,255,0.03)";
+        for (
+          let gx = Math.floor(left / gridStep) * gridStep;
+          gx < right;
+          gx += gridStep
+        ) {
+          ctx.moveTo(gx, top);
+          ctx.lineTo(gx, bottom);
+        }
+        for (
+          let gy = Math.floor(top / gridStep) * gridStep;
+          gy < bottom;
+          gy += gridStep
+        ) {
+          ctx.moveTo(left, gy);
+          ctx.lineTo(right, gy);
+        }
+        ctx.stroke();
+
+        ctx.restore();
+      }
+
+      // 绘制轨迹
+      function drawTrails(switchTrails){
+        if (switchTrails) {
+          for (let i=0;i<bodies.length;i++){
+            const b = bodies[i];
+            if (b.trail.length>1){
+              ctx.beginPath();
+              for (let k=0;k<b.trail.length;k++){
+                const p = b.trail[k];
+                if (k===0) ctx.moveTo(p.x,p.y); else ctx.lineTo(p.x,p.y);
+              }
+              ctx.strokeStyle = (b.color || '#fff');
+              ctx.globalAlpha = 0.6;
+              ctx.lineWidth = Math.max(1, Math.cbrt(b.m)*0.4);
+              ctx.stroke();
+              ctx.globalAlpha = 1;
+            }
+          }
+        }
+      }
+
+      // 绘制天体
+      function drawCircleWorld(wx, wy, r, color, isSun) {
+        const screen = worldToScreen(wx, wy);
+        ctx.beginPath();
+        if (isSun) {
+          const grad = ctx.createRadialGradient(screen.x, screen.y, r*0.4, screen.x, screen.y, r*4);
+          grad.addColorStop(0,'rgba(255,220,120,0.95)');
+          grad.addColorStop(0.3,'rgba(255,180,80,0.5)');
+          grad.addColorStop(1,'rgba(0,0,0,0)');
+          ctx.fillStyle = grad;
+          ctx.fillRect(screen.x - r*4, screen.y - r*4, r*8, r*8);
+        } else {
+          ctx.fillStyle = color;
+          ctx.arc(screen.x, screen.y, r * camera.scale, 0, Math.PI * 2);
+          ctx.fill();
+        }
+      }
+
+      function worldToScreen(wx, wy) {
+        const cx = canvas.width / 2 / DPR + camera.x;
+        const cy = canvas.height / 2 / DPR + camera.y;
+        return {
+          x: (wx - cx) * camera.scale + canvas.clientWidth / 2,
+          y: (wy - cy) * camera.scale + canvas.clientHeight / 2,
+        };
+      }
+
+      function drawDragArrow() {
+        const start = dragStart;
+        const cur = lastMouse;
+        ctx.beginPath();
+        ctx.moveTo(start.sx, start.sy);
+        ctx.lineTo(cur.x, cur.y);
+        ctx.strokeStyle = "rgba(255,255,255,0.9)";
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        // 箭头头
+        const dx = cur.x - start.sx,
+          dy = cur.y - start.sy;
+        const ang = Math.atan2(dy, dx);
+        const len = Math.hypot(dx, dy);
+        if (len > 8) {
+          ctx.beginPath();
+          ctx.moveTo(cur.x, cur.y);
+          ctx.lineTo(
+            cur.x - 12 * Math.cos(ang - 0.3),
+            cur.y - 12 * Math.sin(ang - 0.3)
+          );
+          ctx.lineTo(
+            cur.x - 12 * Math.cos(ang + 0.3),
+            cur.y - 12 * Math.sin(ang + 0.3)
+          );
+          ctx.closePath();
+          ctx.fillStyle = "rgba(255,255,255,0.9)";
+          ctx.fill();
+        }
+      }
+
+      // 随机生成小天体的颜色
+      function pickColor(i) {
+        const h = (i * 137.5) % 360;
+        return `hsl(${h} 90% 60%)`;
+      }
+
+      // 太阳配置映射UI变更
+      function syncUI() {
+        SUN.mass = parseInt(sunMass.value);
+        SUN.radius = Math.sqrt(SUN.mass) * 0.3;
+      }
+      setInterval(syncUI, 200);
+
+      // 主循环
+      let lastT = performance.now();
+      function loop(t) {
+        const dtReal = (t - lastT) / 1000;
+        let timeStep = Math.max(1e-5, parseFloat(dtInput.value));
+        lastT = t;
+        if (!paused) {
+          // 多个小步长以提升稳定性
+          const steps = Math.max(1, Math.floor(dtReal / timeStep));
+          for (let i = 0; i < steps; i++) physicsStep(timeStep);
+        }
+        render();
+        requestAnimationFrame(loop);
+      }
+      requestAnimationFrame(loop);
+
+      // 初始化：在中心放置太阳（固定）
+      // 太阳位于世界中心。把世界中心设为屏幕中心的当前世界位置
+      camera.x = 0;
+      camera.y = 0;
+      camera.scale = 1;
+      // 设置SUN坐标为世界坐标中心
+      SUN.x = canvas.width / 2 / DPR + camera.x;
+      SUN.y = canvas.height / 2 / DPR + camera.y;
+
+      // 保持太阳坐标在窗口尺寸改变时更新（这里太阳固定在世界原点，不随camera变化）
+      window.addEventListener("resize", () => {
+        SUN.x = canvas.width / 2 / DPR + camera.x;
+        SUN.y = canvas.height / 2 / DPR + camera.y;
+      });
+
+      // 提示信息
+      showOverlay("左键拖动设置初速度并生成；单击快速生成（带切向速度）。");
+    </script>
+  </body>
+</html>
