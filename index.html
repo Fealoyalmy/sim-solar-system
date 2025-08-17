@@ -91,7 +91,15 @@
           type="number"
           value="100"
           step="1"
-          style="width: 90px"
+          style="width: 60px"
+      /></label>
+      <label
+        >融合极限距离：<input
+          id="mergeLimitInput"
+          type="number"
+          value="0.6"
+          step="1"
+          style="width: 60px"
       /></label>
       <label class="stat"
         >时间系数dt：<input
@@ -99,7 +107,7 @@
           type="number"
           value="0.016"
           step="0.001"
-          style="width: 70px"
+          style="width: 60px"
       /></label>
       <button id="btnClear">清空小天体</button>
       <button id="centerBtn">重置太阳</button>
@@ -128,7 +136,29 @@
       const dtInput = document.getElementById("dt");
       const btnClear = document.getElementById("btnClear");
       const btnPause = document.getElementById("btnPause");
+      
 
+      // 初速度拖拽状态
+      let isDragging = false;
+      let dragStart = null; // {sx,sy} 屏幕坐标
+      let dragStartWorld = null; // 世界坐标
+      let lastMouse = { x: 0, y: 0 };
+
+      // 右键平移状态
+      let isPanning = false;
+      let panStart = null; // 屏幕
+      let camStart = null;
+
+      // 运行参数
+      let paused = false;
+      // let timeStep = 0.016; // 模拟 dt
+      const radiusFactor = 0.3;
+      const softening = 3; // 软化项
+      const maxBodies = 400; // 最大天体数
+      const trailArrMaxSize = 60; // 轨迹数组最大长度
+      const switchTrails = false; // 是否开启轨迹功能
+
+      
       // 使 canvas 分辨率正确
       function resize() {
         const r = window.devicePixelRatio || 1;
@@ -165,6 +195,7 @@
       // 坐标转换的设备像素比
       const DPR = window.devicePixelRatio || 1;
 
+
       // 天体数组
       const bodies = [];
 
@@ -173,28 +204,9 @@
         x: canvas.width / 2 / DPR, // world coord
         y: canvas.height / 2 / DPR,
         mass: sunMass.value,
-        radius: Math.sqrt(sunMass.value) * 0.3,
+        radius: Math.sqrt(sunMass.value) * radiusFactor,
         fixed: true,
       };
-
-      // 初速度拖拽状态
-      let isDragging = false;
-      let dragStart = null; // {sx,sy} 屏幕坐标
-      let dragStartWorld = null; // 世界坐标
-      let lastMouse = { x: 0, y: 0 };
-
-      // 右键平移状态
-      let isPanning = false;
-      let panStart = null; // 屏幕
-      let camStart = null;
-
-      // 运行参数
-      let paused = false;
-      // let timeStep = 0.016; // 模拟 dt
-      const softening = 3; // 软化项
-      const maxBodies = 400; // 最大天体数
-      const trailArrMaxSize = 60; // 轨迹数组最大长度
-      const switchTrails = false; // 是否开启轨迹功能
 
       // 添加天体函数
       function addBody(x, y, mass, vx = 0, vy = 0) {
@@ -207,9 +219,9 @@
           vy,
           ax: 0,
           ay: 0,
-          radius: Math.sqrt(mass) * 0.3, //Math.max(2, Math.log10(mass + 1) * 2),
+          radius: Math.sqrt(mass) * radiusFactor, //Math.max(2, Math.log10(mass + 1) * 2),
           color: pickColor(bodies.length + 1),
-          trail: []
+          trail: [],
         });
       }
 
@@ -380,7 +392,7 @@
           const bi = bodies[i];
           // 与太阳
           const dx = SUN.x - bi.x,
-              dy = SUN.y - bi.y;
+            dy = SUN.y - bi.y;
           let r2 = calR(SUN, bi);
           let r = Math.sqrt(r2);
           let f = (G * SUN.mass * bi.mass) / r2;
@@ -417,8 +429,40 @@
           b.x += b.vx * dt;
           b.y += b.vy * dt;
           // 更新轨迹数组
-          b.trail.push({x: b.x, y: b.y});
+          b.trail.push({ x: b.x, y: b.y });
           if (b.trail.length > trailArrMaxSize) b.trail.shift();
+        }
+
+        // 简化碰撞处理: 合并相距过近的天体
+        const mergeLimit = document.getElementById("mergeLimitInput");
+        for (let i = 0; i < bodies.length; i++) {
+          for (let j = i + 1; j < bodies.length; j++) {
+            const A = bodies[i],
+              B = bodies[j];
+            const dx = B.x - A.x,
+              dy = B.y - A.y;
+            const dist = Math.hypot(dx, dy);
+            if (dist < (A.radius + B.radius) * parseFloat(mergeLimit.value)) {
+              // 小质量的向大质量的合并
+              const larger = A.mass >= B.mass ? A : B;
+              const smaller = A.mass >= B.mass ? B : A;
+              // conserve momentum
+              larger.vx =
+                (larger.vx * larger.mass + smaller.vx * smaller.mass) /
+                (larger.mass + smaller.mass);
+              larger.vy =
+                (larger.vy * larger.mass + smaller.vy * smaller.mass) /
+                (larger.mass + smaller.mass);
+              larger.mass += smaller.mass;
+              larger.radius = Math.sqrt(larger.mass) * radiusFactor;
+              // bodies中移除小质量天体
+              const idx = bodies.indexOf(smaller);
+              if (idx != -1) bodies.splice(idx, 1);
+              i = -1;
+              console.log(smaller + " merged into " + larger);
+              break;
+            }
+          }
         }
       }
 
@@ -493,19 +537,20 @@
       }
 
       // 绘制轨迹
-      function drawTrails(switchTrails){
+      function drawTrails(switchTrails) {
         if (switchTrails) {
-          for (let i=0;i<bodies.length;i++){
+          for (let i = 0; i < bodies.length; i++) {
             const b = bodies[i];
-            if (b.trail.length>1){
+            if (b.trail.length > 1) {
               ctx.beginPath();
-              for (let k=0;k<b.trail.length;k++){
+              for (let k = 0; k < b.trail.length; k++) {
                 const p = b.trail[k];
-                if (k===0) ctx.moveTo(p.x,p.y); else ctx.lineTo(p.x,p.y);
+                if (k === 0) ctx.moveTo(p.x, p.y);
+                else ctx.lineTo(p.x, p.y);
               }
-              ctx.strokeStyle = (b.color || '#fff');
+              ctx.strokeStyle = b.color || "#fff";
               ctx.globalAlpha = 0.6;
-              ctx.lineWidth = Math.max(1, Math.cbrt(b.m)*0.4);
+              ctx.lineWidth = Math.max(1, Math.cbrt(b.m) * 0.4);
               ctx.stroke();
               ctx.globalAlpha = 1;
             }
@@ -518,12 +563,24 @@
         const screen = worldToScreen(wx, wy);
         ctx.beginPath();
         if (isSun) {
-          const grad = ctx.createRadialGradient(screen.x, screen.y, r * 0.4 * camera.scale, screen.x, screen.y, r * 4 * camera.scale);
-          grad.addColorStop(0,'rgba(255,220,120,0.95)');
-          grad.addColorStop(0.3,'rgba(255,180,80,0.5)');
-          grad.addColorStop(1,'rgba(0,0,0,0)');
+          const grad = ctx.createRadialGradient(
+            screen.x,
+            screen.y,
+            r * 0.4 * camera.scale,
+            screen.x,
+            screen.y,
+            r * 4 * camera.scale
+          );
+          grad.addColorStop(0, "rgba(255,220,120,0.95)");
+          grad.addColorStop(0.3, "rgba(255,180,80,0.5)");
+          grad.addColorStop(1, "rgba(0,0,0,0)");
           ctx.fillStyle = grad;
-          ctx.fillRect(screen.x - r * 4 * camera.scale, screen.y - r * 4 * camera.scale, r * 8 * camera.scale, r * 8 * camera.scale);
+          ctx.fillRect(
+            screen.x - r * 4 * camera.scale,
+            screen.y - r * 4 * camera.scale,
+            r * 8 * camera.scale,
+            r * 8 * camera.scale
+          );
         } else {
           ctx.fillStyle = color;
           ctx.arc(screen.x, screen.y, r * camera.scale, 0, Math.PI * 2);
